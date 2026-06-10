@@ -84,6 +84,130 @@ def _asset_exists(asset_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Rabi / Zaid Temporal Smoothing Helpers
+# ---------------------------------------------------------------------------
+
+def _window_correction(bands: list, anchor_prev: ee.Image, anchor_next: ee.Image = None, anchor_zero_mask: ee.Image = None) -> list:
+    corrected = []
+    n = len(bands)
+    for i in range(n):
+        prev = anchor_prev if i == 0 else corrected[i - 1]
+        cur = bands[i]
+        
+        if i < n - 1:
+            nxt = bands[i + 1]
+        else:
+            nxt = anchor_next
+
+        if nxt is None:
+            out = cur.where(prev.eq(0), 0)
+        else:
+            out = cur
+            # Rule 1 — heal isolated dry gap
+            heal = prev.eq(1).And(cur.eq(0)).And(nxt.eq(1))
+            out = out.where(heal, 1)
+            # Rule 3 — once dry, stay dry
+            out = out.where(prev.eq(0), 0)
+
+        if anchor_zero_mask is not None:
+            out = out.where(anchor_zero_mask, 0)
+            
+        corrected.append(out)
+    return corrected
+
+
+def _min_flips_correction(observed_bands: list, names: list) -> tuple:
+    n = len(observed_bands)
+    observed = ee.Image.cat(observed_bands).rename(names)
+    best_cutoff = ee.Image.constant(0)
+    best_dist = ee.Image.constant(n + 1)
+
+    for k in range(n + 1):
+        pattern = ee.Image.cat([
+            ee.Image.constant(1 if j < k else 0) for j in range(n)
+        ]).rename(names)
+        dist = observed.neq(pattern).reduce(ee.Reducer.sum())
+        is_better = dist.lt(best_dist)
+        
+        best_cutoff = best_cutoff.where(is_better, k)
+        best_dist = best_dist.where(is_better, dist)
+
+    result = [best_cutoff.gt(i).rename(names[i]) for i in range(n)]
+    return result, best_cutoff
+
+
+def _hybrid_correction(bands: list, names: list, anchor_prev: ee.Image, anchor_next: ee.Image = None, anchor_zero_mask: ee.Image = None) -> ee.Image:
+    observed = ee.Image.cat(bands).rename(names)
+
+    win_list = _window_correction(bands, anchor_prev, anchor_next, anchor_zero_mask)
+    win_image = ee.Image.cat(win_list).rename(names)
+
+    mf_list, _ = _min_flips_correction(bands, names)
+    mf_image = ee.Image.cat(mf_list).rename(names)
+
+    win_flips = observed.neq(win_image).reduce(ee.Reducer.sum())
+    mf_flips = observed.neq(mf_image).reduce(ee.Reducer.sum())
+    use_mf = mf_flips.lt(win_flips)
+
+    final_bands = [
+        win_image.select(name).where(use_mf, mf_image.select(name))
+        for name in names
+    ]
+    return ee.Image.cat(final_bands).rename(names)
+
+
+def _apply_rabi_zaid_smoothing(image: ee.Image, year: int, title: str, asset_root: Optional[str]) -> ee.Image:
+    """Apply hybrid temporal smoothing to BOY (Rabi+Zaid) and EOY (Rabi) bands."""
+    # 27-band Kharif-aligned grid mapping: Kharif sits exactly at BW_12 to BW_21
+    boy_names = [f'BW_{i}' for i in range(1, 12)]     # BW_1 to BW_11
+    kharif_names = [f'BW_{i}' for i in range(12, 22)] # BW_12 to BW_21
+    eoy_names = [f'BW_{i}' for i in range(22, 28)]    # BW_22 to BW_27
+
+    boy_bands = [image.select(n) for n in boy_names]
+    eoy_bands = [image.select(n) for n in eoy_names]
+
+    if asset_root:
+        root = asset_root.rstrip('/')
+        prev_asset = f"{root}/RF_water_FullYear_{year-1}_{title}"
+        next_asset = f"{root}/RF_water_FullYear_{year+1}_{title}"
+    else:
+        prev_asset = next_asset = ""
+
+    # PREV anchor for BOY
+    if _asset_exists(prev_asset):
+        prev_year_bw27 = ee.Image(prev_asset).select('BW_27')
+        print(f'  Smoothing: Using {year-1} BW_27 as BOY anchor')
+    else:
+        prev_year_bw27 = image.select('BW_1')
+        print('  Smoothing: Previous year asset not found, using current BW_1 as BOY anchor')
+
+    # NEXT anchor for EOY
+    if _asset_exists(next_asset):
+        next_year_bw1 = ee.Image(next_asset).select('BW_1')
+        print(f'  Smoothing: Using {year+1} BW_1 as EOY anchor')
+    else:
+        next_year_bw1 = image.select('BW_27')
+        print('  Smoothing: Next year asset not found, using current BW_27 as EOY anchor')
+
+    # --- Process Block 1 (BOY) ---
+    bw12_current = image.select('BW_12')
+    corrected_boy = _hybrid_correction(boy_bands, boy_names, prev_year_bw27, bw12_current, None)
+
+    # --- Process Block 2 (EOY) ---
+    last_kharif = image.select('BW_21')
+    kharif_zero = last_kharif.eq(0)
+    corrected_eoy = _hybrid_correction(eoy_bands, eoy_names, last_kharif, next_year_bw1, kharif_zero)
+
+    # Assemble Final Image
+    kharif_unchanged = image.select(kharif_names)
+    smoothed = corrected_boy.addBands(kharif_unchanged).addBands(corrected_eoy)
+
+    # Retain the original no-data masks and metadata properties
+    smoothed = smoothed.updateMask(image.mask()).toByte()
+    return ee.Image(smoothed.copyProperties(image, image.propertyNames()))
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -227,6 +351,9 @@ def download_temporal_images_for_year(
         base_props.update(extra_properties)
     fullyear_stack = fullyear_stack.set(base_props)
 
+    # --- APPLY RABI/ZAID TEMPORAL SMOOTHING ---
+    fullyear_stack = _apply_rabi_zaid_smoothing(fullyear_stack, year, title, asset_root)
+
     fullyear_name = f'RF_water_FullYear_{year}_{title}'
 
     out: dict = {
@@ -250,7 +377,7 @@ def download_temporal_images_for_year(
             print(f'  ♻ Full-year asset already exists, skipping: {fullyear_id}')
         else:
             t = ee.batch.Export.image.toAsset(
-                image=fullyear_stack.toByte(),
+                image=fullyear_stack,
                 description=fullyear_name,
                 assetId=fullyear_id,
                 region=admin.geometry,
@@ -266,7 +393,7 @@ def download_temporal_images_for_year(
         out['fullyear_drive_filename'] = fullyear_name
 
         t = ee.batch.Export.image.toDrive(
-            image=fullyear_stack.toByte(),
+            image=fullyear_stack,
             description=fullyear_name,
             folder=drive_folder,
             fileNamePrefix=fullyear_name,
