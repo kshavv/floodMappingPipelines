@@ -62,7 +62,7 @@ STATES = {
     'Delhi':                   {'code': 'XX',  'bbox': (76.6329, 28.2085, 77.5377, 29.0845), 'gaul': 'Delhi'},
     'Goa':                     {'code': 'XX',  'bbox': (73.4790, 14.6916, 74.5417, 15.9975), 'gaul': 'Goa'},
     'Gujarat':                 {'code': 'XX',  'bbox': (67.9782, 19.9208, 74.6789, 24.9058), 'gaul': 'Gujarat'},
-    'Haryana':                 {'code': 'br', 'bbox': (74.2653, 27.4560, 77.7920, 31.1304), 'gaul': 'Haryana'},
+    'Haryana':                 {'code': 'hr', 'bbox': (74.2653, 27.4560, 77.7920, 31.1304), 'gaul': 'Haryana'},
     'Himachal Pradesh':        {'code': 'XX',  'bbox': (75.3788, 30.1845, 79.1957, 33.3719), 'gaul': 'Himachal Pradesh'},
     'Jharkhand':               {'code': 'XX',  'bbox': (83.1236, 21.7666, 88.1733, 25.5484), 'gaul': 'Jharkhand'},
     'Karnataka':               {'code': 'ka', 'bbox': (73.8547, 11.3745, 78.7775, 18.6551), 'gaul': 'Karnataka'},
@@ -101,3 +101,42 @@ def state_config(state: str) -> dict:
 # (UTC hours). For a given calendar date we try the bare layer first, then
 # each suffix in order; the first one that returns 200 OK wins.
 LAYER_SUFFIX_PROBE = ['', '_06', '_12', '_18']
+
+
+def state_polygon(state: str):
+    """Resolve a state's GAUL level-1 polygon via Earth Engine.
+
+    Called when the user picks state-only mode but still wants the
+    output masked to the actual state boundary instead of the bbox
+    rectangle. Returns ``(polygon_geojson_dict, bbox_tuple)`` — same
+    shape as ``districts.resolve_district`` so the orchestrator can
+    use it interchangeably.
+
+    Raises ``ImportError`` if earthengine-api isn't installed; raises
+    ``RuntimeError`` if no matching GAUL row is found.
+    """
+    try:
+        import ee
+    except ImportError as exc:
+        raise ImportError(
+            'state_polygon needs earthengine-api.\n'
+            '  pip install earthengine-api && earthengine authenticate\n'
+            'Or pass `clip_to_state=False` to keep the bbox rectangle.'
+        ) from exc
+
+    cfg = state_config(state)
+    fc = (ee.FeatureCollection('FAO/GAUL/2015/level1')
+          .filter(ee.Filter.And(
+              ee.Filter.eq('ADM0_NAME', 'India'),
+              ee.Filter.eq('ADM1_NAME', cfg['gaul']))))
+    if fc.size().getInfo() == 0:
+        raise RuntimeError(
+            f'No GAUL level-1 row for state {state!r} '
+            f'(ADM1_NAME={cfg["gaul"]!r}).')
+
+    geom = fc.geometry().simplify(100)
+    geojson = geom.getInfo()
+    bbox = geom.bounds().coordinates().getInfo()[0]
+    xs = [c[0] for c in bbox]
+    ys = [c[1] for c in bbox]
+    return geojson, (min(xs), min(ys), max(xs), max(ys))

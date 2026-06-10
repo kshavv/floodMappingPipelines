@@ -1,20 +1,31 @@
 """Top-level entry point.
 
-For one (state, year), iterate over every calendar day in the Kharif
-window (Jun 1 → Oct 4, matching the GEE classifier's Kharif slot
-range), probe Bhuvan for that day's layer, fetch + stitch the tiles,
-and pack the resulting 0/1 masks into a single multi-band GeoTIFF with
-one band per ISO date.
+For one (state, year) — and optionally a single district within it —
+iterate over every calendar day in the Kharif window (Jun 1 → Oct 18,
+140 days), probe Bhuvan for that day's layer, fetch + stitch the
+tiles, and pack the resulting 0/1 masks into a single multi-band
+GeoTIFF with one band per ISO date.
 
 Days with no Bhuvan data become all-zero bands (so the band count is
 constant and the time index is preserved). Band names are the ISO
 dates.
+
+District mode
+-------------
+Passing ``district='Ernakulam'`` (or supplying ``district_geometry``
+directly) constrains the output to that district's polygon. Two
+benefits:
+  * Massively fewer tile requests — only tiles whose bbox intersects
+    the district are fetched (typically 10-40 tiles vs. the 500-1000
+    for a whole state).
+  * Output is district-shaped: pixels outside the polygon are zeroed.
 
 Memory note
 -----------
 A state-sized canvas at Bhuvan's zoom 10 is ~5000×7000 pixels per
 band; 140 bands × that × uint8 ≈ 5 GiB. We never hold the full stack
 in RAM — bands are written to disk one at a time as they're computed.
+District-mode canvases are far smaller (~500-2000 pixels per side).
 """
 from __future__ import annotations
 
@@ -52,12 +63,7 @@ def _open_stack_writer(path: Path,
                        shape: Tuple[int, int],
                        transform: Tuple[float, ...],
                        n_bands: int):
-    """Open a new multi-band uint8 GeoTIFF for streaming band writes.
-
-    Returns the open ``rasterio`` dataset; caller is responsible for
-    closing it. Compression is deflate; the file is tiled so partial
-    bands stream efficiently.
-    """
+    """Open a new multi-band uint8 GeoTIFF for streaming band writes."""
     height, width = shape
     a, b, c, d, e, f = transform
     aff = Affine(a, b, c, d, e, f)
@@ -81,77 +87,351 @@ def _open_stack_writer(path: Path,
     return rasterio.open(path, 'w', **profile)
 
 
+# --- Helpers --------------------------------------------------------------
+
+def _slugify(name: str) -> str:
+    import re
+    s = (name or '').lower()
+    s = re.sub(r'&', ' and ', s)
+    s = re.sub(r'[^a-z0-9]+', '_', s)
+    return s.strip('_')
+
+
+def _default_output_path(state: str, year: int, district: Optional[str]) -> str:
+    parts = ['bhuvan_kharif', _slugify(state)]
+    if district:
+        parts.append(_slugify(district))
+    parts.append(str(year))
+    return f"./{'_'.join(parts)}.tif"
+
+
+def _default_day_output_path(state: str, date_iso: str,
+                             district: Optional[str]) -> str:
+    parts = ['bhuvan_flood', _slugify(state)]
+    if district:
+        parts.append(_slugify(district))
+    parts.append(date_iso)
+    return f"./{'_'.join(parts)}.tif"
+
+
+def _resolve_aoi(state, district, district_geometry, bbox_buffer_deg,
+                 *, clip_to_state=True):
+    """Shared AOI resolution for both the year and day endpoints.
+
+    Returns ``(cfg, polygon_or_None, aoi_bbox, aoi_label)`` so the two
+    endpoints can stop duplicating this logic.
+
+    In whole-state mode (no ``district`` / ``district_geometry``), when
+    ``clip_to_state=True`` (the default), we also pull the GAUL level-1
+    polygon for the state and return it as the mask polygon — so the
+    output is state-shaped, not bbox-shaped. If EE isn't available or
+    the lookup fails, we fall back to the bbox rectangle with a
+    warning. Set ``clip_to_state=False`` to skip the polygon clip and
+    force the bbox-only behaviour.
+    """
+    cfg = state_config(state)
+    polygon = None
+    if district_geometry is not None:
+        polygon = district_geometry
+        minx, miny, maxx, maxy = polygon.bounds
+        aoi_bbox = (minx - bbox_buffer_deg, miny - bbox_buffer_deg,
+                    maxx + bbox_buffer_deg, maxy + bbox_buffer_deg)
+        aoi_label = f'{state} / {district or "custom"}'
+    elif district is not None:
+        from .districts import resolve_district, buffer_bbox
+        from shapely.geometry import shape
+        geojson, raw_bbox = resolve_district(state, district)
+        polygon = shape(geojson)
+        aoi_bbox = buffer_bbox(raw_bbox, bbox_buffer_deg)
+        aoi_label = f'{state} / {district}'
+    else:
+        aoi_bbox = cfg['bbox']
+        aoi_label = state
+        if clip_to_state:
+            # Try to clip the output to the actual state polygon. If EE
+            # isn't available, isn't initialised, or the lookup fails
+            # for any reason, fall back to the bbox rectangle.
+            try:
+                from .config import state_polygon
+                from shapely.geometry import shape
+                geojson, _raw_bbox = state_polygon(state)
+                polygon = shape(geojson)
+            except Exception as exc:
+                print(f'  ⚠ State-polygon clip unavailable '
+                      f'({exc.__class__.__name__}: {exc}); falling '
+                      f'back to bbox rectangle.')
+    return cfg, polygon, aoi_bbox, aoi_label
+
+
+def _pick_probe_bbox(aoi_bbox, polygon):
+    """Pick one grid-aligned tile bbox INSIDE the AOI for layer probing."""
+    from .wms_client import covering_tiles, tile_bbox as _tile_bbox
+    tx_min, ty_min, tx_max, ty_max = covering_tiles(aoi_bbox)
+    if polygon is not None:
+        from shapely.geometry import box
+        for ty in range(ty_min, ty_max + 1):
+            for tx in range(tx_min, tx_max + 1):
+                tb = _tile_bbox(tx, ty)
+                if polygon.intersects(box(*tb)):
+                    return tb
+        raise RuntimeError(
+            'No tile in the AOI bbox intersects the polygon. '
+            'Check `district` name or `district_geometry`.')
+    probe_tx = (tx_min + tx_max) // 2
+    probe_ty = (ty_min + ty_max) // 2
+    return _tile_bbox(probe_tx, probe_ty)
+
+
 # --- Public entry point ---------------------------------------------------
+
+def _count_polygon_vertices(geom) -> int:
+    """Total exterior vertex count across any shapely geometry."""
+    t = geom.geom_type
+    if t == 'Polygon':
+        return len(geom.exterior.coords)
+    if t == 'MultiPolygon':
+        return sum(len(p.exterior.coords) for p in geom.geoms)
+    if t == 'GeometryCollection':
+        return sum(_count_polygon_vertices(g) for g in geom.geoms)
+    return 0
+
+
+def _print_debug_header(*, state, district, district_geometry,
+                        cfg, polygon, aoi_bbox, aoi_label,
+                        all_tiles, kept_tiles,
+                        sample_first, sample_last, sample_dates,
+                        bbox_buffer_deg, output_path, year):
+    """Upfront diagnostic block: prints what the run is about to do."""
+    print('=' * 70)
+    print('STEP 1 — State config')
+    print('=' * 70)
+    print(f"  State           : {state}")
+    print(f"  Bhuvan code     : {cfg['code']!r}")
+    print(f"  GAUL name       : {cfg['gaul']!r}")
+    print(f"  State bbox      : {cfg['bbox']}")
+    sw = cfg['bbox'][2] - cfg['bbox'][0]
+    sh = cfg['bbox'][3] - cfg['bbox'][1]
+    print(f"    width         : {sw:.4f}° (~{sw*111:.0f} km)")
+    print(f"    height        : {sh:.4f}° (~{sh*111:.0f} km)")
+
+    print()
+    print('=' * 70)
+    if polygon is not None:
+        print('STEP 2 — AOI = district polygon')
+        print('=' * 70)
+        src = 'district_geometry param' if district_geometry is not None \
+              else f'FAO GAUL level-2: {district!r}'
+        print(f"  AOI source        : {src}")
+        print(f"  Geometry type     : {polygon.geom_type}")
+        n_pieces = (len(polygon.geoms)
+                    if polygon.geom_type in ('MultiPolygon',
+                                              'GeometryCollection')
+                    else 1)
+        print(f"  Sub-geometries    : {n_pieces}")
+        print(f"  Total vertices    : {_count_polygon_vertices(polygon)}")
+        print(f"  Polygon area (°²) : {polygon.area:.4f}")
+        print(f"  Buffered bbox     : {aoi_bbox}")
+        print(f"  Buffer applied    : {bbox_buffer_deg}° "
+              f"(~{bbox_buffer_deg*111:.1f} km)")
+    else:
+        print('STEP 2 — AOI = whole-state bbox')
+        print('=' * 70)
+        print(f"  AOI bbox          : {aoi_bbox}")
+        print(f"  No polygon filter — every tile in the covering set "
+              f"will be fetched.")
+        print(f"  Output will be bbox-shaped, not state-shaped.")
+
+    print()
+    print('=' * 70)
+    print('STEP 3 — Tile-grid covering at Bhuvan zoom 10')
+    print('=' * 70)
+    from .wms_client import covering_tiles
+    tx_min, ty_min, tx_max, ty_max = covering_tiles(aoi_bbox)
+    n_tx = tx_max - tx_min + 1
+    n_ty = ty_max - ty_min + 1
+    print(f"  Tile-x range      : {tx_min}..{tx_max}  ({n_tx} cols)")
+    print(f"  Tile-y range      : {ty_min}..{ty_max}  ({n_ty} rows)")
+    print(f"  Total tiles       : {len(all_tiles)}  (= {n_tx} × {n_ty})")
+    canvas_mb = n_tx * n_ty * 256 * 256 * 4 / 1e6
+    print(f"  Canvas size       : {n_tx*256} × {n_ty*256} px "
+          f"(~{canvas_mb:.0f} MB RGBA per day in RAM)")
+
+    if polygon is not None:
+        print()
+        print('=' * 70)
+        print('STEP 4 — Polygon filter')
+        print('=' * 70)
+        dropped = len(all_tiles) - len(kept_tiles)
+        print(f"  Tiles before      : {len(all_tiles)}")
+        print(f"  Tiles dropped     : {dropped} (no polygon overlap)")
+        print(f"  Tiles kept        : {len(kept_tiles)}")
+        if len(all_tiles):
+            print(f"  Reduction         : "
+                  f"{100*dropped/len(all_tiles):.0f}%")
+
+    print()
+    print('=' * 70)
+    print(f"STEP 5 — Sample tiles (first 3 + last 3 of "
+          f"{len(kept_tiles)} to fetch)")
+    print('=' * 70)
+    from .wms_client import tile_bbox as _tb
+    n = len(kept_tiles)
+    show_idx = sorted(set(list(range(min(3, n))) + list(range(max(0, n-3), n))))
+    last_shown = -1
+    for i in show_idx:
+        if i > last_shown + 1:
+            print(f"    … ({i - last_shown - 1} tiles in the middle) …")
+        tx, ty = kept_tiles[i]
+        b = _tb(tx, ty)
+        print(f"    [{i+1:>4}/{n}] tx={tx} ty={ty}  "
+              f"bbox=({b[0]:.4f}, {b[1]:.4f}, {b[2]:.4f}, {b[3]:.4f})")
+        last_shown = i
+
+    print()
+    print('=' * 70)
+    print('STEP 6 — Run plan')
+    print('=' * 70)
+    print(f"  AOI label         : {aoi_label}")
+    print(f"  Year              : {year}")
+    print(f"  Kharif days       : {len(sample_dates)}")
+    print(f"  Date range        : {sample_dates[0]} → {sample_dates[-1]}")
+    print(f"  Tiles per data-day: {len(kept_tiles)}")
+    print(f"  Output path       : {output_path}")
+    print(f"  Layer name shape  : flood:{cfg['code']}_YYYY_DD_MM[_HH]")
+    print(f"  Probe suffixes    : '', '_06', '_12', '_18' "
+          f"(first hit wins)")
+    print()
+    est_lo = len(kept_tiles) * 0.10
+    est_hi = len(kept_tiles) * 0.30
+    print(f"  Per-day stitch    : ~{est_lo:.0f}–{est_hi:.0f}s "
+          f"at typical Bhuvan latency.")
+    print(f"  (No-data days cost only 1–4 probe requests.)")
+    print('=' * 70)
+    print()
+
 
 def download_bhuvan_kharif_stack(
     state: str,
     year: int,
-    output_path: str,
+    output_path: Optional[str] = None,
     *,
+    district: Optional[str] = None,
+    district_geometry=None,
+    bbox_buffer_deg: float = 0.05,
+    clip_to_state: bool = True,
     client: Optional[BhuvanClient] = None,
     log: bool = True,
+    debug: bool = False,
+    verbose: bool = False,
+    tile_cache_dir: Optional[str] = None,
 ) -> dict:
-    """Build the multi-band Kharif flood stack for ``(state, year)``.
+    """Build the multi-band Kharif flood stack for one (state, year) —
+    optionally narrowed to a single district.
 
     Parameters
     ----------
     state
         State name registered in ``config.STATES`` (e.g. ``"Kerala"``).
     year
-        Calendar year. The Kharif window is Jun 1 → Oct 4 of this year
-        (140 days = 140 bands).
+        Calendar year. The Kharif window is Jun 1 → Oct 18 of this year.
     output_path
-        Destination GeoTIFF path. Parent directories are created.
+        Destination GeoTIFF path. Auto-derived if omitted:
+        ``./bhuvan_kharif_<state>[_<district>]_<year>.tif``.
+    district
+        Optional district name within the state. When given, the bbox /
+        tile-fetch / output are constrained to the district's polygon
+        (resolved via FAO GAUL level-2 through Earth Engine — caller
+        must have ``ee.Initialize(...)`` already called).
+    district_geometry
+        Optional shapely polygon for the district. Overrides ``district``
+        lookup when given.
+    bbox_buffer_deg
+        Extra padding around the district bbox (default 0.05° ≈ 5.5 km).
     client
-        Optional pre-built :class:`BhuvanClient`. A default one is
-        created if not supplied.
+        Optional pre-built :class:`BhuvanClient`.
     log
-        Print a one-line status per day.
+        Per-day status line. Default True.
+    debug
+        Print a one-time UPFRONT diagnostic block (state config, AOI
+        bbox, tile-grid math, sample tiles, polygon stats, layer-name
+        preview) before any tile is fetched. Useful for tracking what
+        the run is about to do; off by default to keep state-mode logs
+        tidy. Doesn't add per-tile spam — use ``verbose`` for that.
+    verbose
+        Per-TILE logging — every URL, status, response size, elapsed
+        time, for every tile of every data-day. Default False because
+        for whole-state runs this prints thousands of lines per day.
+    tile_cache_dir
+        If given, every raw PNG tile is saved under this directory.
 
     Returns
     -------
     dict
-        Summary of what got built::
-
-            {
-              'state':           'Kerala',
-              'year':            2023,
-              'output_path':     '/.../bhuvan_kharif_kerala_2023.tif',
-              'n_bands':         140,
-              'n_days_with_data':  37,
-              'days_with_data':  ['2023-06-16', ...],
-              'days_without':    ['2023-06-01', ...],
-              'layers_used':     {'2023-06-16': 'flood:kl_2023_16_06_06', ...},
-              'bbox':            (74.5, 8.0, 78.0, 13.0),
-            }
+        Summary of what got built.
     """
-    cfg = state_config(state)
+    cfg, polygon, aoi_bbox, aoi_label = _resolve_aoi(
+        state, district, district_geometry, bbox_buffer_deg,
+        clip_to_state=clip_to_state)
     code = cfg['code']
-    bbox = cfg['bbox']
     client = client or BhuvanClient()
 
-    # A small probe bbox INSIDE the state so the existence probe can
-    # detect "layer exists" by checking for any non-transparent pixel.
-    # We use the center of the state's bbox, snapped to the tile grid.
-    from .wms_client import covering_tiles, tile_bbox as _tile_bbox
-    tx_min, ty_min, tx_max, ty_max = covering_tiles(bbox)
-    probe_tx = (tx_min + tx_max) // 2
-    probe_ty = (ty_min + ty_max) // 2
-    probe_bbox = _tile_bbox(probe_tx, probe_ty)
+    if output_path is None:
+        output_path = _default_output_path(state, year, district)
+
+    probe_bbox = _pick_probe_bbox(aoi_bbox, polygon)
 
     dates = kharif_dates(year)
     band_dates = [d.isoformat() for d in dates]
 
     # Pre-allocate ONLY a single-band canvas (used as the empty fallback)
-    # and learn the output shape + transform from it. The full multi-band
-    # stack is never held in RAM — bands stream directly to the GeoTIFF
-    # as they're computed.
-    empty, transform = empty_mask_for_bbox(bbox)
+    # and learn the output shape + transform from it.
+    empty, transform = empty_mask_for_bbox(aoi_bbox)
     height, width = empty.shape
+
+    # When in district mode, the "empty" template should ALSO be masked
+    # to the polygon — that way no-data bands look identical in shape to
+    # bands-with-data (both are 0 outside the polygon).
+    if polygon is not None:
+        from .stitch import _polygon_pixel_mask
+        poly_mask = _polygon_pixel_mask(polygon, transform, height, width)
+        # `empty` is already all zeros, but multiplying by poly_mask is a
+        # no-op that documents intent; the shape stays (H, W) uint8.
+        empty = empty * poly_mask
 
     layers_used: List[str] = []
     days_with: List[str] = []
     days_without: List[str] = []
+
+    # Compute tile counts once so they're available to both the debug
+    # header (if asked for) and the brief log line below.
+    from .wms_client import tiles_for_bbox
+    all_tiles = tiles_for_bbox(aoi_bbox)
+    if polygon is not None:
+        from .stitch import filter_tiles_by_polygon
+        kept_tiles = filter_tiles_by_polygon(all_tiles, polygon)
+    else:
+        kept_tiles = all_tiles
+
+    if debug:
+        _print_debug_header(
+            state=state, district=district, district_geometry=district_geometry,
+            cfg=cfg, polygon=polygon, aoi_bbox=aoi_bbox, aoi_label=aoi_label,
+            all_tiles=all_tiles, kept_tiles=kept_tiles,
+            sample_first=3, sample_last=3, sample_dates=band_dates,
+            bbox_buffer_deg=bbox_buffer_deg, output_path=str(output_path),
+            year=year,
+        )
+    elif log:
+        # Compact one-block summary when debug is off but log is on.
+        print(f'AOI: {aoi_label}')
+        print(f'  bbox  : {aoi_bbox}')
+        print(f'  canvas: {width} x {height} px')
+        if polygon is not None:
+            print(f'  tiles : {len(kept_tiles)} of {len(all_tiles)} '
+                  f'(polygon filter)')
+        else:
+            print(f'  tiles : {len(kept_tiles)} (whole bbox)')
+        print()
 
     out = Path(output_path)
     dst = _open_stack_writer(out, (height, width), transform, len(dates))
@@ -163,12 +443,11 @@ def download_bhuvan_kharif_stack(
                 print(f'[{band_idx:3d}/{len(dates)}] {iso}  resolving layer …',
                       end=' ', flush=True)
             layer = client.resolve_layer_for_date(code, iso,
-                                                  probe_bbox=probe_bbox)
+                                                  probe_bbox=probe_bbox,
+                                                  verbose=debug or verbose)
             if layer is None:
                 layers_used.append('')
                 days_without.append(iso)
-                # Write the pre-built empty band; cheap, and keeps every
-                # band's shape/transform identical.
                 dst.write(empty, band_idx)
                 dst.set_band_description(band_idx, iso)
                 dst.update_tags(band_idx, date=iso, bhuvan_layer='NONE')
@@ -176,17 +455,36 @@ def download_bhuvan_kharif_stack(
                     print('(no data)')
                 continue
             if log:
-                print(f'{layer}  stitching …', end=' ', flush=True)
-            mask, t2 = stitch_date(client, layer, bbox)
-            # Sanity: the stitch transform must match the pre-allocated one
-            # (same tile grid, same zoom). If it doesn't, the bbox produced
-            # a different covering set — should never happen, but assert so
-            # the failure is loud.
+                print(f'{layer}  stitching …', end=' ' if not verbose else '\n', flush=True)
+            mask, t2, stitch_info = stitch_date(
+                client, layer, aoi_bbox,
+                polygon=polygon,
+                verbose=verbose,
+                tile_cache_dir=tile_cache_dir,
+                return_info=True,
+            )
             if t2 != transform or mask.shape != (height, width):
                 raise RuntimeError(
                     f'Tile-grid mismatch on {iso}: '
                     f'transform {t2} vs {transform}, '
                     f'shape {mask.shape} vs {(height, width)}')
+            if stitch_info['aborted_early']:
+                # Circuit breaker tripped — Bhuvan can't serve this
+                # layer at the full AOI extent. Treat as no-data: write
+                # the empty band, record the dud layer name so the
+                # audit trail captures what we tried.
+                layers_used.append('')
+                days_without.append(iso)
+                dst.write(empty, band_idx)
+                dst.set_band_description(band_idx, iso)
+                dst.update_tags(band_idx, date=iso,
+                                bhuvan_layer=f'ABORTED:{layer}')
+                if log:
+                    fails = stitch_info['tiles_failed']
+                    total = stitch_info['tiles_total']
+                    print(f'(circuit-breaker abort: {fails}/{total} '
+                          f'tiles failed — treating as no-data)')
+                continue
             dst.write(mask, band_idx)
             dst.set_band_description(band_idx, iso)
             dst.update_tags(band_idx, date=iso, bhuvan_layer=layer)
@@ -196,21 +494,31 @@ def download_bhuvan_kharif_stack(
                 print(f'flood-pixels={int(mask.sum())}')
 
         # File-level tags.
-        dst.update_tags(
-            state=state,
-            year=str(year),
-            n_bands=str(len(dates)),
-            kharif_window=f'{band_dates[0]} → {band_dates[-1]}',
-            source='Bhuvan WMS (NRSC), flood layer',
-        )
+        file_tags = {
+            'state':         state,
+            'year':          str(year),
+            'n_bands':       str(len(dates)),
+            'kharif_window': f'{band_dates[0]} → {band_dates[-1]}',
+            'source':        'Bhuvan WMS (NRSC), flood layer',
+        }
+        if district:
+            file_tags['district'] = district
+            file_tags['aoi_mode'] = 'district'
+        elif district_geometry is not None:
+            file_tags['aoi_mode'] = 'custom_geometry'
+        else:
+            file_tags['aoi_mode'] = 'state_bbox'
+        dst.update_tags(**file_tags)
     finally:
         dst.close()
 
     if log:
-        print(f'\n✓ Wrote {out}  ({len(days_with)}/{len(dates)} days with data)')
+        print(f'\n✓ Wrote {out}  '
+              f'({len(days_with)}/{len(dates)} days with data)')
 
     return {
         'state':            state,
+        'district':         district,
         'year':             year,
         'output_path':      str(out),
         'n_bands':          len(dates),
@@ -218,5 +526,204 @@ def download_bhuvan_kharif_stack(
         'days_with_data':   days_with,
         'days_without':     days_without,
         'layers_used':      dict(zip(band_dates, layers_used)),
-        'bbox':             bbox,
+        'bbox':             aoi_bbox,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Single-day endpoint
+# ---------------------------------------------------------------------------
+
+def download_bhuvan_flood_day(
+    state: str,
+    date: str,
+    output_path: Optional[str] = None,
+    *,
+    district: Optional[str] = None,
+    district_geometry=None,
+    bbox_buffer_deg: float = 0.05,
+    clip_to_state: bool = True,
+    client: Optional[BhuvanClient] = None,
+    debug: bool = False,
+    verbose: bool = False,
+    tile_cache_dir: Optional[str] = None,
+) -> dict:
+    """Build a single-band flood mask for one specific date.
+
+    Same AOI logic as :func:`download_bhuvan_kharif_stack` — accepts
+    ``state``, optional ``district`` (resolved via GAUL/EE) or
+    ``district_geometry`` (any shapely polygon). Probes Bhuvan for the
+    date, downloads + stitches the tiles if a layer is found, and
+    writes a SINGLE-BAND ``uint8`` GeoTIFF (0 = land/no-data,
+    1 = flooded).
+
+    If no Bhuvan layer exists for the date, an all-zero (or polygon-
+    shaped all-zero) band is written instead, so the output file is
+    always created.
+
+    Parameters
+    ----------
+    state
+        Registered state name (e.g. ``'Kerala'``).
+    date
+        ISO date string ``'YYYY-MM-DD'``.
+    output_path
+        Destination GeoTIFF. Auto-derived if omitted:
+        ``./bhuvan_flood_<state>[_<district>]_<date>.tif``.
+    district, district_geometry, bbox_buffer_deg, client,
+    debug, verbose, tile_cache_dir
+        Same meaning as in :func:`download_bhuvan_kharif_stack`.
+
+    Returns
+    -------
+    dict
+        ``{'state', 'district', 'date', 'output_path', 'layer_used',
+        'has_data', 'flood_pixels', 'bbox'}``.
+    """
+    import datetime as _dt
+    try:
+        _dt.date.fromisoformat(date)
+    except ValueError:
+        raise ValueError(f'`date` must be ISO YYYY-MM-DD; got {date!r}.')
+
+    cfg, polygon, aoi_bbox, aoi_label = _resolve_aoi(
+        state, district, district_geometry, bbox_buffer_deg,
+        clip_to_state=clip_to_state)
+    code = cfg['code']
+    client = client or BhuvanClient()
+
+    if output_path is None:
+        output_path = _default_day_output_path(state, date, district)
+
+    probe_bbox = _pick_probe_bbox(aoi_bbox, polygon)
+
+    # Pre-tile listing for the debug header.
+    from .wms_client import tiles_for_bbox
+    all_tiles = tiles_for_bbox(aoi_bbox)
+    if polygon is not None:
+        from .stitch import filter_tiles_by_polygon
+        kept_tiles = filter_tiles_by_polygon(all_tiles, polygon)
+    else:
+        kept_tiles = all_tiles
+
+    if debug:
+        _print_debug_header(
+            state=state, district=district,
+            district_geometry=district_geometry,
+            cfg=cfg, polygon=polygon, aoi_bbox=aoi_bbox, aoi_label=aoi_label,
+            all_tiles=all_tiles, kept_tiles=kept_tiles,
+            sample_first=3, sample_last=3, sample_dates=[date],
+            bbox_buffer_deg=bbox_buffer_deg, output_path=str(output_path),
+            year=int(date[:4]),
+        )
+
+    # ── Resolve which (if any) suffix has data ────────────────────
+    if debug:
+        print(f'STEP 7 — Probing Bhuvan for {date!r}')
+        print('=' * 70)
+    layer = client.resolve_layer_for_date(
+        code, date, probe_bbox=probe_bbox, verbose=debug or verbose)
+    if debug:
+        if layer:
+            print(f'  ✓ Layer found: {layer}')
+        else:
+            print(f'  ✗ No layer for {date}. Writing all-zero band.')
+        print()
+
+    # ── Build the canvas + (optional) polygon mask ────────────────
+    empty, transform = empty_mask_for_bbox(aoi_bbox)
+    height, width = empty.shape
+    if polygon is not None:
+        from .stitch import _polygon_pixel_mask
+        empty = empty * _polygon_pixel_mask(polygon, transform, height, width)
+
+    # ── Stitch (or fall through to all-zero) ───────────────────────
+    stitch_aborted = False
+    if layer is not None:
+        if debug:
+            print(f'STEP 8 — Fetching {len(kept_tiles)} tiles')
+            print('=' * 70)
+        mask, _, stitch_info = stitch_date(
+            client, layer, aoi_bbox,
+            polygon=polygon,
+            verbose=verbose,
+            tile_cache_dir=tile_cache_dir,
+            return_info=True,
+        )
+        if stitch_info['aborted_early']:
+            stitch_aborted = True
+            if debug:
+                print(f"  ✗ Circuit breaker tripped after "
+                      f"{stitch_info['tiles_attempted']} tiles "
+                      f"(all {stitch_info['tiles_failed']} failed). "
+                      f"Treating {date} as no-data.")
+            mask = empty
+            layer = None        # so the tag below records 'NONE'
+    else:
+        mask = empty
+
+    flood_pixels = int(mask.sum())
+
+    # ── Write the single-band GeoTIFF ──────────────────────────────
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    a, b, c, d, e, f = transform
+    profile = {
+        'driver':    'GTiff',
+        'dtype':     'uint8',
+        'count':     1,
+        'height':    height,
+        'width':     width,
+        'transform': Affine(a, b, c, d, e, f),
+        'crs':       CRS.from_epsg(4326),
+        'compress':  'deflate',
+        'predictor': 2,
+        'tiled':     True,
+        'blockxsize': 256,
+        'blockysize': 256,
+        'nodata':    None,
+    }
+    with rasterio.open(out, 'w', **profile) as dst:
+        dst.write(mask, 1)
+        dst.set_band_description(1, date)
+        dst.update_tags(1, date=date, bhuvan_layer=layer or 'NONE')
+        tags = {
+            'state':    state,
+            'date':     date,
+            'aoi_mode': ('district' if district else
+                         ('custom_geometry' if district_geometry is not None
+                          else 'state_bbox')),
+            'source':   'Bhuvan WMS (NRSC), flood layer',
+        }
+        if district:
+            tags['district'] = district
+        dst.update_tags(**tags)
+
+    if debug:
+        print()
+        print('=' * 70)
+        print(f'STEP 9 — Summary')
+        print('=' * 70)
+        print(f'  Output           : {out}')
+        print(f'  Layer used       : {layer or "(none)"}')
+        print(f'  Has data         : {layer is not None}')
+        print(f'  Mask shape       : {mask.shape}')
+        print(f'  Flood pixels     : {flood_pixels:,}')
+        print(f'  % of canvas      : '
+              f'{100*flood_pixels/max(mask.size,1):.4f}%')
+        print('=' * 70)
+    else:
+        print(f'✓ {date}  {aoi_label}  '
+              f'layer={layer or "NONE":>30s}  '
+              f'flood_px={flood_pixels:,}  → {out}')
+
+    return {
+        'state':         state,
+        'district':      district,
+        'date':          date,
+        'output_path':   str(out),
+        'layer_used':    layer,
+        'has_data':      layer is not None,
+        'flood_pixels':  flood_pixels,
+        'bbox':          aoi_bbox,
     }
