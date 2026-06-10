@@ -62,7 +62,9 @@ def kharif_dates(year: int) -> List[_dt.date]:
 def _open_stack_writer(path: Path,
                        shape: Tuple[int, int],
                        transform: Tuple[float, ...],
-                       n_bands: int):
+                       n_bands: int,
+                       *,
+                       nodata=None):
     """Open a new multi-band uint8 GeoTIFF for streaming band writes."""
     height, width = shape
     a, b, c, d, e, f = transform
@@ -80,7 +82,7 @@ def _open_stack_writer(path: Path,
         'tiled':     True,
         'blockxsize': 256,
         'blockysize': 256,
-        'nodata':    None,
+        'nodata':    nodata,
         'BIGTIFF':   'IF_SAFER',
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -388,15 +390,19 @@ def download_bhuvan_kharif_stack(
     empty, transform = empty_mask_for_bbox(aoi_bbox)
     height, width = empty.shape
 
-    # When in district mode, the "empty" template should ALSO be masked
-    # to the polygon — that way no-data bands look identical in shape to
-    # bands-with-data (both are 0 outside the polygon).
+    # When a polygon is given (district mode OR clip_to_state in
+    # whole-state mode), build the inside-mask once. Outside-polygon
+    # pixels will be written as 255 (nodata), so QGIS/GDAL respect the
+    # state shape rather than rendering a bbox rectangle.
+    import numpy as _np
     if polygon is not None:
         from .stitch import _polygon_pixel_mask
-        poly_mask = _polygon_pixel_mask(polygon, transform, height, width)
-        # `empty` is already all zeros, but multiplying by poly_mask is a
-        # no-op that documents intent; the shape stays (H, W) uint8.
-        empty = empty * poly_mask
+        inside_mask = _polygon_pixel_mask(polygon, transform, height, width)
+        # `empty` is the no-data band template; set outside-polygon to
+        # 255 so no-data days look the same as data-days outside Kerala.
+        empty = _np.where(inside_mask == 1, 0, 255).astype('uint8')
+    else:
+        inside_mask = _np.ones((height, width), dtype='uint8')
 
     layers_used: List[str] = []
     days_with: List[str] = []
@@ -434,7 +440,8 @@ def download_bhuvan_kharif_stack(
         print()
 
     out = Path(output_path)
-    dst = _open_stack_writer(out, (height, width), transform, len(dates))
+    dst = _open_stack_writer(out, (height, width), transform, len(dates),
+                             nodata=255 if polygon is not None else None)
     try:
         for i, d in enumerate(dates):
             iso = d.isoformat()
@@ -485,13 +492,18 @@ def download_bhuvan_kharif_stack(
                     print(f'(circuit-breaker abort: {fails}/{total} '
                           f'tiles failed — treating as no-data)')
                 continue
+            # Encode outside-polygon pixels as 255 nodata.
+            if polygon is not None:
+                mask = mask.copy()
+                mask[inside_mask == 0] = 255
             dst.write(mask, band_idx)
             dst.set_band_description(band_idx, iso)
             dst.update_tags(band_idx, date=iso, bhuvan_layer=layer)
             layers_used.append(layer)
             days_with.append(iso)
             if log:
-                print(f'flood-pixels={int(mask.sum())}')
+                inside_flood = int(((mask != 255) & (mask == 1)).sum())
+                print(f'flood-pixels={inside_flood}')
 
         # File-level tags.
         file_tags = {
@@ -631,11 +643,21 @@ def download_bhuvan_flood_day(
         print()
 
     # ── Build the canvas + (optional) polygon mask ────────────────
+    # inside_mask: 1 inside polygon, 0 outside (or all-1 if no polygon).
+    # Outside-polygon pixels are written as 255 (nodata) — QGIS / GDAL
+    # respect the nodata tag and the state shape becomes visible,
+    # not a bounding rectangle of 0s.
+    import numpy as _np
     empty, transform = empty_mask_for_bbox(aoi_bbox)
     height, width = empty.shape
     if polygon is not None:
         from .stitch import _polygon_pixel_mask
-        empty = empty * _polygon_pixel_mask(polygon, transform, height, width)
+        inside_mask = _polygon_pixel_mask(polygon, transform, height, width)
+        # Make the no-data template 255-outside so it matches data-day
+        # bands.
+        empty = _np.where(inside_mask == 1, 0, 255).astype('uint8')
+    else:
+        inside_mask = _np.ones((height, width), dtype='uint8')
 
     # ── Stitch (or fall through to all-zero) ───────────────────────
     stitch_aborted = False
@@ -664,6 +686,12 @@ def download_bhuvan_flood_day(
 
     flood_pixels = int(mask.sum())
 
+    # Encode outside-polygon as 255 (nodata). Inside the polygon, the
+    # mask values 0/1 are preserved verbatim.
+    if polygon is not None:
+        mask = mask.copy()
+        mask[inside_mask == 0] = 255
+
     # ── Write the single-band GeoTIFF ──────────────────────────────
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -681,7 +709,7 @@ def download_bhuvan_flood_day(
         'tiled':     True,
         'blockxsize': 256,
         'blockysize': 256,
-        'nodata':    None,
+        'nodata':    255 if polygon is not None else None,
     }
     with rasterio.open(out, 'w', **profile) as dst:
         dst.write(mask, 1)
