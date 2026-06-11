@@ -35,6 +35,16 @@ def slugify(s: str) -> str:
     s = re.sub(r'[^a-z0-9]+', '_', s)
     return s.strip('_')
 
+def get_district_names(state_name: str) -> list[str]:
+
+    districts = _india_district_names(state_name)
+    if not districts:
+        raise ValueError(
+            f'State "{state_name}" not found in FAO/GAUL/2015 level2 '
+            f'(India). Check spelling — GAUL uses names like '
+            f'"Kerala", "Tamil Nadu", "Uttar Pradesh".'
+        )
+    return districts
 
 def _india_state_geom(state_name: str) -> ee.Geometry:
     fc = (ee.FeatureCollection(GAUL_LEVEL1)
@@ -68,12 +78,7 @@ def _india_district_geom(state_name: str,
 
 def _districts_to_indices(state_name: str,
                           districts: Iterable[str]) -> tuple[list[int], list[str]]:
-    """Given user-supplied district names, return (1-based indices,
-    canonical district names) in the alphabetised state list.
 
-    Raises ValueError if any district is unknown for the given state,
-    listing the close matches.
-    """
     all_districts = _india_district_names(state_name)
     # Case-insensitive lookup so callers don't have to mirror GAUL casing.
     lower_map = {d.lower(): d for d in all_districts}
