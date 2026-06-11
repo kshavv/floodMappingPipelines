@@ -9,7 +9,15 @@
 - An active Google Earth Engine account.
 - A Google Cloud Project with the Earth Engine API enabled.
 
-## 2. Installation & Requirements
+## 2. Creating a virtual environment(Optional)
+```bash
+# 1. Create a virtual environment 
+python -m venv .venv
+source .venv/bin/activate          # macOS / Linux
+.venv\Scripts\activate             # Windows
+```
+
+## 3. Installation & Requirements
 
 Install the required dependencies using pip(These are required by bhuvan pipeline or the flood Pipeline):
 
@@ -17,13 +25,7 @@ Install the required dependencies using pip(These are required by bhuvan pipelin
 pip install -r requirements.txt
 ```
 
-## 3. Creating a virtual environment(Optional)
-```bash
-# 1. Create a virtual environment (recommended)
-python -m venv .venv
-source .venv/bin/activate          # macOS / Linux
-.venv\Scripts\activate             # Windows
-```
+
 
 ## 4. Authentication & Initialization
 
@@ -195,8 +197,6 @@ classify_years(
 
 - Earth Engine authentication must be completed before running the pipeline.
 - Classification should only be run after all temporal image export tasks have completed successfully.
-- Outputs can be exported to Earth Engine Assets and/or Google Drive depending on the `destinations` parameter.
-
 
 # Bhuvan Flood Pipeline
 
@@ -204,6 +204,13 @@ Downloads daily flood maps from Bhuvan (NRSC) over WMS, stitches them
 into georeferenced GeoTIFFs, and supports both single-date and full-
 year (Kharif window) batch runs.
 ---
+## 1. Creating a virtual environment(Optional)
+```bash
+# 1. Create a virtual environment
+python -m venv .venv
+source .venv/bin/activate          # macOS / Linux
+.venv\Scripts\activate             # Windows
+```
 
 # 2. Install dependencies
 ```
