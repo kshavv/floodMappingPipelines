@@ -1,0 +1,14 @@
+# core library to connect to earth engine
+earthengine-api>=0.1.380
+
+# HTTP + image I/O — used by wms_client.py to talk to Bhuvan
+requests>=2.31
+Pillow>=10.0
+ 
+# Array + raster I/O — the core of stitch.py and pipeline.py
+numpy>=1.24
+rasterio>=1.3
+ 
+# Polygon math — used for AOI clipping (district + state-boundary modes)
+shapely>=2.0
+ 

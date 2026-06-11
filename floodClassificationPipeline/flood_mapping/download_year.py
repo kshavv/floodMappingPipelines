@@ -1,35 +1,5 @@
 """Top-level pipeline: download the full-year temporal image for a given
 administrative region and year.
-
-[PATH2] Each year produces a SINGLE full-year stack on the Kharif-aligned
-27-bi-week grid.  The Kharif (and, later, Rabi / Zaid) sub-stacks are sliced
-out of this full-year stack by the EE app at classify time, so no separate
-season assets are exported — for the target year or for historical years.
-
-Two call shapes:
-
-  # Whole state
-  download_temporal_images_for_year(
-      state='Kerala', year=2024,
-      training_fc='projects/.../full_dataset_v3',
-      asset_root='projects/.../TemporalImages',
-      destinations='asset')
-
-  # Subset of districts
-  download_temporal_images_for_year(
-      state='Kerala', districts=['Ernakulam', 'Kollam', 'Thrissur'],
-      year=2024,
-      training_fc='projects/.../full_dataset_v3',
-      asset_root='projects/.../TemporalImages',
-      destinations=['asset', 'drive'],
-      drive_folder='flood_temporal_images')
-
-  # Many years (historical + target), full-year stacks for all
-  download_temporal_images_for_years(
-      state='Assam', years=[2019, 2020, 2021, 2022, 2023, 2024],
-      training_fc='projects/.../full_dataset_v3',
-      asset_root='projects/.../TemporalImages',
-      destinations='asset')
 """
 from __future__ import annotations
 from typing import Iterable, List, Optional, Union
