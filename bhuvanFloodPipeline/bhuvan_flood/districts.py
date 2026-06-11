@@ -4,21 +4,6 @@ The pipeline supports per-district downloads, where you give the state
 and a single district name and the tile-fetch is constrained to the
 district's polygon (with a small buffer).
 
-Two ways to provide the polygon:
-
-1. **Resolve via Earth Engine** (default).
-   Requires the user to have ``earthengine-api`` installed and have run
-   ``earthengine authenticate`` once. Pulls the GAUL level-2 polygon
-   for the requested district. Same data source as the GEE classifier,
-   so district numbering and footprints line up byte-for-byte.
-
-2. **Pass a polygon directly** via the ``district_geometry`` parameter
-   to :func:`download_bhuvan_kharif_stack`. Useful when EE isn't
-   available, or when you want a custom AOI.
-
-This module isolates the EE dependency so the rest of the package
-works without it — EE is only imported when ``resolve_district()`` is
-actually called.
 """
 from __future__ import annotations
 

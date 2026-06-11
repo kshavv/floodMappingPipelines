@@ -1,31 +1,9 @@
 """Top-level entry point.
 
-For one (state, year) — and optionally a single district within it —
-iterate over every calendar day in the Kharif window (Jun 1 → Oct 18,
-140 days), probe Bhuvan for that day's layer, fetch + stitch the
-tiles, and pack the resulting 0/1 masks into a single multi-band
-GeoTIFF with one band per ISO date.
-
 Days with no Bhuvan data become all-zero bands (so the band count is
 constant and the time index is preserved). Band names are the ISO
 dates.
 
-District mode
--------------
-Passing ``district='Ernakulam'`` (or supplying ``district_geometry``
-directly) constrains the output to that district's polygon. Two
-benefits:
-  * Massively fewer tile requests — only tiles whose bbox intersects
-    the district are fetched (typically 10-40 tiles vs. the 500-1000
-    for a whole state).
-  * Output is district-shaped: pixels outside the polygon are zeroed.
-
-Memory note
------------
-A state-sized canvas at Bhuvan's zoom 10 is ~5000×7000 pixels per
-band; 140 bands × that × uint8 ≈ 5 GiB. We never hold the full stack
-in RAM — bands are written to disk one at a time as they're computed.
-District-mode canvases are far smaller (~500-2000 pixels per side).
 """
 from __future__ import annotations
 
@@ -327,50 +305,7 @@ def download_bhuvan_kharif_stack(
     verbose: bool = False,
     tile_cache_dir: Optional[str] = None,
 ) -> dict:
-    """Build the multi-band Kharif flood stack for one (state, year) —
-    optionally narrowed to a single district.
-
-    Parameters
-    ----------
-    state
-        State name registered in ``config.STATES`` (e.g. ``"Kerala"``).
-    year
-        Calendar year. The Kharif window is Jun 1 → Oct 18 of this year.
-    output_path
-        Destination GeoTIFF path. Auto-derived if omitted:
-        ``./bhuvan_kharif_<state>[_<district>]_<year>.tif``.
-    district
-        Optional district name within the state. When given, the bbox /
-        tile-fetch / output are constrained to the district's polygon
-        (resolved via FAO GAUL level-2 through Earth Engine — caller
-        must have ``ee.Initialize(...)`` already called).
-    district_geometry
-        Optional shapely polygon for the district. Overrides ``district``
-        lookup when given.
-    bbox_buffer_deg
-        Extra padding around the district bbox (default 0.05° ≈ 5.5 km).
-    client
-        Optional pre-built :class:`BhuvanClient`.
-    log
-        Per-day status line. Default True.
-    debug
-        Print a one-time UPFRONT diagnostic block (state config, AOI
-        bbox, tile-grid math, sample tiles, polygon stats, layer-name
-        preview) before any tile is fetched. Useful for tracking what
-        the run is about to do; off by default to keep state-mode logs
-        tidy. Doesn't add per-tile spam — use ``verbose`` for that.
-    verbose
-        Per-TILE logging — every URL, status, response size, elapsed
-        time, for every tile of every data-day. Default False because
-        for whole-state runs this prints thousands of lines per day.
-    tile_cache_dir
-        If given, every raw PNG tile is saved under this directory.
-
-    Returns
-    -------
-    dict
-        Summary of what got built.
-    """
+    """Download and stitch Bhuvan flood layers for the Kharif season of a year."""
     cfg, polygon, aoi_bbox, aoi_label = _resolve_aoi(
         state, district, district_geometry, bbox_buffer_deg,
         clip_to_state=clip_to_state)
@@ -506,12 +441,33 @@ def download_bhuvan_kharif_stack(
                 print(f'flood-pixels={inside_flood}')
 
         # File-level tags.
+        # File-level tags. Includes a summary of which dates had data
+        # so you can answer "is this band's all-zero a real dry day or
+        # a no-data day?" without scanning per-band tags.
+        n_with = len(days_with)
+        n_without = len(days_without)
+        # Bands marked ABORTED — circuit-breaker aborts (probe passed
+        # but Bhuvan couldn't serve the layer at the AOI extent).
+        aborted_bands = [
+            band_dates[i]
+            for i, lyr in enumerate(layers_used)
+            if lyr == '' and band_dates[i] in days_without
+        ]
         file_tags = {
-            'state':         state,
-            'year':          str(year),
-            'n_bands':       str(len(dates)),
-            'kharif_window': f'{band_dates[0]} → {band_dates[-1]}',
-            'source':        'Bhuvan WMS (NRSC), flood layer',
+            'state':            state,
+            'year':             str(year),
+            'n_bands':          str(len(dates)),
+            'kharif_window':    f'{band_dates[0]} → {band_dates[-1]}',
+            'source':           'Bhuvan WMS (NRSC), flood layer',
+            # Summary of which dates Bhuvan actually had data for.
+            'n_days_with_data': str(n_with),
+            'n_days_no_data':   str(n_without),
+            'days_with_data':   ','.join(days_with),     # ISO-date CSV
+            'days_no_data':     ','.join(days_without),  # ISO-date CSV
+            'bands_with_data':  ','.join(
+                str(i + 1) for i, d in enumerate(band_dates) if d in days_with),
+            'bands_no_data':    ','.join(
+                str(i + 1) for i, d in enumerate(band_dates) if d in days_without),
         }
         if district:
             file_tags['district'] = district
@@ -560,38 +516,7 @@ def download_bhuvan_flood_day(
     verbose: bool = False,
     tile_cache_dir: Optional[str] = None,
 ) -> dict:
-    """Build a single-band flood mask for one specific date.
 
-    Same AOI logic as :func:`download_bhuvan_kharif_stack` — accepts
-    ``state``, optional ``district`` (resolved via GAUL/EE) or
-    ``district_geometry`` (any shapely polygon). Probes Bhuvan for the
-    date, downloads + stitches the tiles if a layer is found, and
-    writes a SINGLE-BAND ``uint8`` GeoTIFF (0 = land/no-data,
-    1 = flooded).
-
-    If no Bhuvan layer exists for the date, an all-zero (or polygon-
-    shaped all-zero) band is written instead, so the output file is
-    always created.
-
-    Parameters
-    ----------
-    state
-        Registered state name (e.g. ``'Kerala'``).
-    date
-        ISO date string ``'YYYY-MM-DD'``.
-    output_path
-        Destination GeoTIFF. Auto-derived if omitted:
-        ``./bhuvan_flood_<state>[_<district>]_<date>.tif``.
-    district, district_geometry, bbox_buffer_deg, client,
-    debug, verbose, tile_cache_dir
-        Same meaning as in :func:`download_bhuvan_kharif_stack`.
-
-    Returns
-    -------
-    dict
-        ``{'state', 'district', 'date', 'output_path', 'layer_used',
-        'has_data', 'flood_pixels', 'bbox'}``.
-    """
     import datetime as _dt
     try:
         _dt.date.fromisoformat(date)
@@ -685,6 +610,7 @@ def download_bhuvan_flood_day(
         mask = empty
 
     flood_pixels = int(mask.sum())
+    # flood_pixels = int((mask == 1).sum())
 
     # Encode outside-polygon as 255 (nodata). Inside the polygon, the
     # mask values 0/1 are preserved verbatim.
@@ -710,6 +636,7 @@ def download_bhuvan_flood_day(
         'blockxsize': 256,
         'blockysize': 256,
         'nodata':    255 if polygon is not None else None,
+        # 'nodata':    255,
     }
     with rasterio.open(out, 'w', **profile) as dst:
         dst.write(mask, 1)
