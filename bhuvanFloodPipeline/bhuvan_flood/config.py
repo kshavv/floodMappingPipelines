@@ -1,26 +1,4 @@
 """Configuration for the Bhuvan flood-tile download pipeline.
-
-State mapping
--------------
-Each state maps to (1) the state code Bhuvan embeds in its WMS layer
-names (e.g. ``flood:Akl_2021_19_10_06`` for Kerala — the ``Akl`` is
-the full code, prefix included) and (2) a generous geographic bounding
-box used to enumerate the WMS tile grid.
-
-The bbox is derived from FAO GAUL level-1 polygons + a 0.2° buffer on
-all sides so the covering tile set captures every tile that overlaps
-the state.
-
-Tile grid
----------
-The Bhuvan flood layers are published on the standard WMS-C quadtree
-in EPSG:4326 with the world 2 tiles wide at z=0, 256-px tiles, origin
-(-180, -90). At ZOOM the pixel size in degrees is::
-
-    deg_per_pixel = 180 / (256 * 2**ZOOM)
-
-For these layers ZOOM = 10  (verified against an observed BBOX), so
-pixel size ≈ 0.0006866455° (~76 m at the equator).
 """
 from __future__ import annotations
 
@@ -33,22 +11,11 @@ WORLD_NORTH = 90.0
 TILE_SIZE_DEG = 180.0 / (2 ** ZOOM)          # 0.17578125 at z=10
 DEG_PER_PIXEL = TILE_SIZE_DEG / TILE_PX      # 0.0006866455... at z=10
 
-# --- Flood-pixel colour test (port of the QGIS calculator) ----------------
-# A pixel is flooded iff (R, G, B, A) == FLOOD_RGBA. Bhuvan uses cyan on a
-# transparent background; transparent pixels (A=0) are non-flood.
+
 FLOOD_RGBA = (0, 255, 255, 255)
 
-# --- State mapping --------------------------------------------------------
-# code  : full state code as used by Bhuvan in layer names
-#         (`flood:<code>_YYYY_DD_MM[_HH]`). Includes any leading prefix
-#         (e.g. 'Akl' for Kerala) — passed verbatim into the layer name.
-# bbox  : (west, south, east, north) in EPSG:4326. Derived from FAO GAUL
-#         level-1 polygons + 0.2° buffer on all sides so the covering
-#         tile set captures every tile that overlaps the state.
-# gaul  : GAUL level-1 ADM1_NAME used for precise polygon clipping.
-#
-# Codes marked 'XX' are placeholders — fill them in from Bhuvan's
-# GetCapabilities or by inspecting a working layer URL.
+# --- State mapping with bbox mapping and state code --------------------------------------------------------
+
 STATES = {
     'Andaman and Nicobar':     {'code': 'XX',  'bbox': (92.0042,  6.5560, 94.4776, 13.8754), 'gaul': 'Andaman and Nicobar'},
     'Andhra Pradesh':          {'code': 'XX',  'bbox': (76.5570, 12.4118, 84.9607, 20.1161), 'gaul': 'Andhra Pradesh'},
@@ -100,21 +67,10 @@ def state_config(state: str) -> dict:
 # Bhuvan publishes flood layers with optional sub-day suffixes 06 / 12 / 18
 # (UTC hours). For a given calendar date we try the bare layer first, then
 # each suffix in order; the first one that returns 200 OK wins.
-LAYER_SUFFIX_PROBE = ['', '_06', '_12', '_18']
+LAYER_SUFFIX_PROBE = ['', '_06','_15','_04' '_12', '_18','_20']
 
 
 def state_polygon(state: str):
-    """Resolve a state's GAUL level-1 polygon via Earth Engine.
-
-    Called when the user picks state-only mode but still wants the
-    output masked to the actual state boundary instead of the bbox
-    rectangle. Returns ``(polygon_geojson_dict, bbox_tuple)`` — same
-    shape as ``districts.resolve_district`` so the orchestrator can
-    use it interchangeably.
-
-    Raises ``ImportError`` if earthengine-api isn't installed; raises
-    ``RuntimeError`` if no matching GAUL row is found.
-    """
     try:
         import ee
     except ImportError as exc:

@@ -18,6 +18,8 @@ from .classify_config import (
     fullyear_asset_id,
 )
 
+from .admin import AdminRoi, slugify, get_district_names
+
 __all__ = [
     # download
     'download_temporal_images_for_year',
@@ -31,5 +33,5 @@ __all__ = [
     'build_classification_image',
     'KHARIF_SLOTS', 'ZAID_SLOTS', 'RABI_SLOTS', 'season_for_slot',
     'CLASS_PALETTE', 'CLASS_LABELS', 'DEFAULT_THRESHOLDS',
-    'fullyear_asset_id',
+    'fullyear_asset_id','get_district_names'
 ]

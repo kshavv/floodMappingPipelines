@@ -112,6 +112,20 @@ download_temporal_images_for_year(
 
 > **Important:** Ensure that all export tasks generated during Step 1 have completed successfully in the Earth Engine **Tasks** tab before proceeding to classification.
 
+> **Note** To get the district name for a state 
+ Run this
+
+ ```python
+ import ee
+ee.Initialize(project='gentle-operator-308420')
+from flood_mapping import get_district_names
+
+# Fetch all districts for Assam
+assam_districts = get_district_names('Assam')
+
+print(f"Total districts found: {len(assam_districts)}")
+print(assam_districts)
+```
 ---
 
 # Step 2: Classification Endpoint
