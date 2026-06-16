@@ -94,6 +94,16 @@ def _default_day_output_path(state: str, date_iso: str,
     return f"./{'_'.join(parts)}.tif"
 
 
+def _default_biweek_output_path(state: str, year: int, district: Optional[str],
+                                method: str) -> str:
+    parts = ['bhuvan_kharif_biweek', _slugify(state)]
+    if district:
+        parts.append(_slugify(district))
+    parts.append(str(year))
+    parts.append(method)
+    return f"./{'_'.join(parts)}.tif"
+
+
 def _resolve_aoi(state, district, district_geometry, bbox_buffer_deg,
                  *, clip_to_state=True):
     """Shared AOI resolution for both the year and day endpoints.
@@ -681,4 +691,310 @@ def download_bhuvan_flood_day(
         'has_data':      layer is not None,
         'flood_pixels':  flood_pixels,
         'bbox':          aoi_bbox,
+    }
+
+# ---------------------------------------------------------------------------
+# Bi-weekly endpoint
+# ---------------------------------------------------------------------------
+
+def download_bhuvan_kharif_biweek_stack(
+    state: str,
+    year: int,
+    output_path: Optional[str] = None,
+    *,
+    method: str = 'union',
+    district: Optional[str] = None,
+    district_geometry=None,
+    bbox_buffer_deg: float = 0.05,
+    clip_to_state: bool = True,
+    client: Optional[BhuvanClient] = None,
+    log: bool = True,
+    debug: bool = False,
+    verbose: bool = False,
+    tile_cache_dir: Optional[str] = None,
+) -> dict:
+    """Download Bhuvan flood layers and aggregate into 10 Kharif bi-weeks.
+
+    Matches the 14-day grid used by the GEE flood-classification
+    pipeline: BW_12 (starts Jun 4) through BW_21 (ends Oct 7), 10
+    bands total. Each band is one bi-week.
+
+    Parameters
+    ----------
+    method
+        How to combine the ~14 days of Bhuvan masks within each
+        bi-week into a single band. Currently supported:
+
+        ``'union'``         — logical OR. Pixel is 1 if any day in
+                              the bi-week was flooded at that pixel.
+        ``'mid_snapshot'``  — pick the data-day nearest the bi-week
+                              midpoint (Day 7); ties go to the
+                              earlier date.
+
+        Add more strategies by extending ``biweek.COMBINERS``.
+
+    All other parameters are the same as ``download_bhuvan_kharif_stack``.
+    See that function for AOI / clipping / logging / probe options.
+
+    Returns
+    -------
+    dict
+        Run summary including which date(s) fed each bi-week band.
+    """
+    from .biweek import (
+        COMBINERS, KHARIF_BW_NUMBERS, KHARIF_BW_LENGTH_DAYS,
+        biweek_label, combine_union, combine_mid_snapshot,
+        kharif_biweek_dates, kharif_biweek_starts,
+    )
+
+    if method not in COMBINERS:
+        raise ValueError(
+            f'Unknown method {method!r}. Known: {sorted(COMBINERS)}')
+
+    cfg, polygon, aoi_bbox, aoi_label = _resolve_aoi(
+        state, district, district_geometry, bbox_buffer_deg,
+        clip_to_state=clip_to_state)
+    code = cfg['code']
+    client = client or BhuvanClient()
+
+    if output_path is None:
+        output_path = _default_biweek_output_path(state, year, district, method)
+
+    probe_bbox = _pick_probe_bbox(aoi_bbox, polygon)
+
+    biweek_starts = kharif_biweek_starts(year)
+    biweek_dates  = kharif_biweek_dates(year)
+
+    # All daily dates in flat order, plus a reverse map back to (bw_idx, day).
+    flat_dates: List[_dt.date] = []
+    date_to_bw: Dict[_dt.date, int] = {}
+    for bw_idx, days in enumerate(biweek_dates):
+        for d in days:
+            flat_dates.append(d)
+            date_to_bw[d] = bw_idx
+
+    # Empty (no-data) template — same logic as the daily year endpoint.
+    import numpy as _np
+    empty, transform = empty_mask_for_bbox(aoi_bbox)
+    height, width = empty.shape
+    if polygon is not None:
+        from .stitch import _polygon_pixel_mask
+        inside_mask = _polygon_pixel_mask(polygon, transform, height, width)
+        empty = _np.where(inside_mask == 1, 0, 255).astype('uint8')
+    else:
+        inside_mask = _np.ones((height, width), dtype='uint8')
+
+    # Tile listing for debug header.
+    from .wms_client import tiles_for_bbox
+    all_tiles = tiles_for_bbox(aoi_bbox)
+    if polygon is not None:
+        from .stitch import filter_tiles_by_polygon
+        kept_tiles = filter_tiles_by_polygon(all_tiles, polygon)
+    else:
+        kept_tiles = all_tiles
+
+    if debug:
+        _print_debug_header(
+            state=state, district=district,
+            district_geometry=district_geometry,
+            cfg=cfg, polygon=polygon, aoi_bbox=aoi_bbox, aoi_label=aoi_label,
+            all_tiles=all_tiles, kept_tiles=kept_tiles,
+            sample_first=3, sample_last=3,
+            sample_dates=[d.isoformat() for d in flat_dates],
+            bbox_buffer_deg=bbox_buffer_deg, output_path=str(output_path),
+            year=year,
+        )
+        print(f'  Bi-week method  : {method}')
+        print(f'  Bi-week bands   : {len(KHARIF_BW_NUMBERS)} '
+              f'(BW_12 .. BW_21)')
+        for bw_idx in range(len(KHARIF_BW_NUMBERS)):
+            print(f'    {biweek_label(year, bw_idx)}')
+        print()
+    elif log:
+        print(f'AOI: {aoi_label}')
+        print(f'  bbox    : {aoi_bbox}')
+        print(f'  method  : {method}')
+        print(f'  bi-weeks: {len(KHARIF_BW_NUMBERS)} (BW_12 .. BW_21)')
+        print()
+
+    # ── Accumulator state per bi-week ──────────────────────────────
+    # For 'union': the running OR-result mask, updated as each
+    # data-day arrives. Starts as None until the first data-day in
+    # that bi-week; finalised to `empty` if no data days appeared.
+    #
+    # For 'mid_snapshot': the candidate (date, mask) — replaced
+    # whenever we see a data-day that's closer to the bi-week
+    # midpoint than the current candidate.
+    union_running: List[Optional[_np.ndarray]] = [None] * len(KHARIF_BW_NUMBERS)
+    snap_candidate: List[Optional[Tuple[_dt.date, _np.ndarray]]] = [
+        None] * len(KHARIF_BW_NUMBERS)
+    bw_data_days: List[List[str]] = [[] for _ in KHARIF_BW_NUMBERS]
+    bw_layers_used: List[List[str]] = [[] for _ in KHARIF_BW_NUMBERS]
+    bw_chosen_date: List[Optional[str]] = [None] * len(KHARIF_BW_NUMBERS)
+
+    def _update_union(bw_idx: int, mask: _np.ndarray) -> None:
+        cur = union_running[bw_idx]
+        if cur is None:
+            union_running[bw_idx] = combine_union([mask])
+        else:
+            union_running[bw_idx] = combine_union([cur, mask])
+
+    def _update_snapshot(bw_idx: int, d: _dt.date, mask: _np.ndarray) -> None:
+        midpoint = biweek_starts[bw_idx] + _dt.timedelta(days=7)
+        new_score = (abs((d - midpoint).days), d)
+        cur = snap_candidate[bw_idx]
+        if cur is None:
+            snap_candidate[bw_idx] = (d, mask)
+            return
+        cur_d, _ = cur
+        cur_score = (abs((cur_d - midpoint).days), cur_d)
+        if new_score < cur_score:
+            snap_candidate[bw_idx] = (d, mask)
+
+    # ── Main loop: iterate every daily date, fetch when present ────
+    n_days = len(flat_dates)
+    for i, d in enumerate(flat_dates):
+        iso = d.isoformat()
+        bw_idx = date_to_bw[d]
+        if log:
+            print(f'[{i+1:3d}/{n_days}] {iso}  (BW_{KHARIF_BW_NUMBERS[bw_idx]})  '
+                  f'resolving …', end=' ', flush=True)
+
+        layer = client.resolve_layer_for_date(
+            code, iso, probe_bbox=probe_bbox, verbose=debug or verbose)
+        if layer is None:
+            if log: print('(no data)')
+            continue
+
+        if log:
+            print(f'{layer}  stitching …',
+                  end=' ' if not verbose else '\n', flush=True)
+        mask, t2, stitch_info = stitch_date(
+            client, layer, aoi_bbox,
+            polygon=polygon,
+            verbose=verbose,
+            tile_cache_dir=tile_cache_dir,
+            return_info=True,
+        )
+        if t2 != transform or mask.shape != (height, width):
+            raise RuntimeError(
+                f'Tile-grid mismatch on {iso}: '
+                f'transform {t2} vs {transform}, '
+                f'shape {mask.shape} vs {(height, width)}')
+        if stitch_info['aborted_early']:
+            if log:
+                fails = stitch_info['tiles_failed']
+                total = stitch_info['tiles_total']
+                print(f'(circuit-breaker abort: {fails}/{total} '
+                      f'tiles failed — treating as no-data)')
+            continue
+
+        # Apply outside-polygon nodata so combiners see consistent data.
+        if polygon is not None:
+            mask = mask.copy()
+            mask[inside_mask == 0] = 255
+
+        bw_data_days[bw_idx].append(iso)
+        bw_layers_used[bw_idx].append(layer)
+
+        if method == 'union':
+            _update_union(bw_idx, mask)
+        elif method == 'mid_snapshot':
+            _update_snapshot(bw_idx, d, mask)
+
+        if log:
+            inside_flood = int(((mask != 255) & (mask == 1)).sum())
+            print(f'flood-pixels={inside_flood}')
+
+    # ── Finalise each bi-week band ─────────────────────────────────
+    out_bands: List[_np.ndarray] = []
+    for bw_idx in range(len(KHARIF_BW_NUMBERS)):
+        if method == 'union':
+            band = union_running[bw_idx]
+            if band is None:
+                band = empty
+        else:   # mid_snapshot
+            cur = snap_candidate[bw_idx]
+            if cur is None:
+                band = empty
+            else:
+                bw_chosen_date[bw_idx] = cur[0].isoformat()
+                band = cur[1]
+        out_bands.append(band)
+
+    # ── Write the multi-band GeoTIFF ───────────────────────────────
+    out = Path(output_path)
+    dst = _open_stack_writer(out, (height, width), transform,
+                             len(KHARIF_BW_NUMBERS),
+                             nodata=255 if polygon is not None else None)
+    try:
+        for bw_idx in range(len(KHARIF_BW_NUMBERS)):
+            bw_num = KHARIF_BW_NUMBERS[bw_idx]
+            band_no = bw_idx + 1
+            dst.write(out_bands[bw_idx], band_no)
+            dst.set_band_description(band_no, biweek_label(year, bw_idx))
+            tags = {
+                'biweek_number': str(bw_num),
+                'biweek_start':  biweek_starts[bw_idx].isoformat(),
+                'biweek_end':    (biweek_starts[bw_idx]
+                                  + _dt.timedelta(days=13)).isoformat(),
+                'data_days':     ','.join(bw_data_days[bw_idx]),
+                'n_data_days':   str(len(bw_data_days[bw_idx])),
+                'layers_used':   ','.join(bw_layers_used[bw_idx]) or 'NONE',
+            }
+            if method == 'mid_snapshot' and bw_chosen_date[bw_idx]:
+                tags['snapshot_date'] = bw_chosen_date[bw_idx]
+            dst.update_tags(band_no, **tags)
+
+        # File-level tags.
+        n_with = sum(1 for days in bw_data_days if days)
+        n_without = len(KHARIF_BW_NUMBERS) - n_with
+        file_tags = {
+            'state':            state,
+            'year':             str(year),
+            'method':           method,
+            'n_bands':          str(len(KHARIF_BW_NUMBERS)),
+            'biweek_grid':      'BW_12..BW_21 (Jun 4 → Oct 7)',
+            'source':           'Bhuvan WMS (NRSC), bi-weekly aggregate',
+            'n_biweeks_with_data':  str(n_with),
+            'n_biweeks_no_data':    str(n_without),
+            'biweeks_with_data':    ','.join(
+                str(KHARIF_BW_NUMBERS[i])
+                for i, days in enumerate(bw_data_days) if days),
+            'biweeks_no_data':      ','.join(
+                str(KHARIF_BW_NUMBERS[i])
+                for i, days in enumerate(bw_data_days) if not days),
+        }
+        if district:
+            file_tags['district'] = district
+            file_tags['aoi_mode'] = 'district'
+        elif district_geometry is not None:
+            file_tags['aoi_mode'] = 'custom_geometry'
+        else:
+            file_tags['aoi_mode'] = 'state_bbox'
+        dst.update_tags(**file_tags)
+    finally:
+        dst.close()
+
+    if log:
+        print(f'\n✓ Wrote {out}  '
+              f'({sum(1 for d in bw_data_days if d)}/{len(KHARIF_BW_NUMBERS)} '
+              f'bi-weeks with data)')
+
+    return {
+        'state':                state,
+        'district':             district,
+        'year':                 year,
+        'method':               method,
+        'output_path':          str(out),
+        'n_bands':              len(KHARIF_BW_NUMBERS),
+        'biweek_numbers':       list(KHARIF_BW_NUMBERS),
+        'biweek_starts':        [d.isoformat() for d in biweek_starts],
+        'biweek_data_days':     {KHARIF_BW_NUMBERS[i]: bw_data_days[i]
+                                 for i in range(len(KHARIF_BW_NUMBERS))},
+        'biweek_layers_used':   {KHARIF_BW_NUMBERS[i]: bw_layers_used[i]
+                                 for i in range(len(KHARIF_BW_NUMBERS))},
+        'biweek_snapshot_date': {KHARIF_BW_NUMBERS[i]: bw_chosen_date[i]
+                                 for i in range(len(KHARIF_BW_NUMBERS))},
+        'bbox':                 aoi_bbox,
     }

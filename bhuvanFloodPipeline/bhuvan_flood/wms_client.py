@@ -26,13 +26,6 @@ from .config import (
 
 def layer_name(code: str, date_iso: str, suffix: str = '') -> str:
     """Build a Bhuvan flood layer name for a calendar date.
-
-    ``code`` is the full state code Bhuvan uses in its layer names
-    (e.g. ``'Akl'`` for Kerala, ``'Aas'`` for Assam) — pass the exact
-    string from ``config.STATES[<state>]['code']``.
-
-    Bhuvan's naming swaps day/month relative to ISO: the URL uses
-    ``YYYY_DD_MM`` (and an optional ``_HH`` suffix), so we mirror that.
     """
     y, m, d = date_iso.split('-')
     return f'flood:{code}_{y}_{int(d):02d}_{int(m):02d}{suffix}'
@@ -64,10 +57,6 @@ def tile_url(layer: str, west: float, south: float, east: float, north: float,
 def covering_tiles(bbox: Tuple[float, float, float, float]
                    ) -> Tuple[int, int, int, int]:
     """Tile-grid indices that fully cover ``bbox`` at the configured zoom.
-
-    Returns ``(tx_min, ty_min, tx_max, ty_max)`` with ``ty`` measured from
-    the top (north) so it grows southward — matches how every WMS-C tile
-    server numbers tiles. The returned range is inclusive on both ends.
     """
     west, south, east, north = bbox
     tx_min = int((west  - WORLD_WEST)  // TILE_SIZE_DEG)
@@ -101,7 +90,7 @@ class BhuvanClient:
 
     def __init__(self, *, timeout: float = 30.0, max_retries: int = 3,
                  backoff: float = 1.5,
-                 probe_timeout: float = 5.0,
+                 probe_timeout: float = 20.0,
                  user_agent: str = 'bhuvan-flood-pipeline/1.0'):
         self.timeout = timeout
         self.max_retries = max_retries
@@ -149,16 +138,6 @@ class BhuvanClient:
                                *, verbose: bool = False
                                ) -> Optional[str]:
         """Return the first layer-name variant that has data, else None.
-
-        Probes Bhuvan by fetching one 256x256 tile inside ``probe_bbox``.
-        A layer "exists" if the response is a 256x256 PNG with at least
-        one non-transparent pixel.
-
-        Uses ``_get(..., fast_fail=True)`` — short timeout, no retries.
-        This is the cure for "no-data days take forever" — Bhuvan
-        refuses non-existent layers fast, and we now believe it the
-        first time instead of grinding through 3 retries × 4 suffixes
-        of exponential backoff.
         """
         if probe_bbox is None:
             west, south = WORLD_WEST, WORLD_NORTH - TILE_SIZE_DEG
@@ -169,8 +148,30 @@ class BhuvanClient:
         for suf in suffixes:
             layer = layer_name(code, date_iso, suf)
             url = tile_url(layer, west, south, east, north)
+
+            # Try once with fast-fail. If we hit a ReadTimeout, give
+            # Bhuvan one more chance — the first uncached request can
+            # be slow, but the second usually hits a warm cache. Other
+            # network errors and HTTP failures are treated as
+            # "this suffix isn't available" and we move on.
+            r = None
             try:
                 r = self._get(url, fast_fail=True)
+            except requests.exceptions.ReadTimeout:
+                if verbose:
+                    print(f'      probe suffix {suf!r:>5}: ReadTimeout '
+                          f'on first try, retrying once …')
+                try:
+                    r = self._get(url, fast_fail=True)
+                except requests.RequestException as exc:
+                    if verbose:
+                        print(f'      probe suffix {suf!r:>5}: retry also '
+                              f'failed ({exc.__class__.__name__}) — skipping')
+                    continue
+                except RuntimeError as exc:
+                    if verbose:
+                        print(f'      probe suffix {suf!r:>5}: retry: {exc}')
+                    continue
             except requests.RequestException as exc:
                 if verbose:
                     print(f'      probe suffix {suf!r:>5}: network error '
@@ -193,16 +194,23 @@ class BhuvanClient:
                             print(f'      probe suffix {suf!r:>5}: PNG size '
                                   f'{im.size} != expected — no layer')
                         continue
-                    rgba = im.convert('RGBA')
-                    alpha_max = max(rgba.split()[3].getextrema())
-                    if alpha_max > 0:
-                        if verbose:
-                            print(f'      probe suffix {suf!r:>5}: '
-                                  f'HIT ({len(r.content)} B, alpha_max={alpha_max})')
-                        return layer
-                    elif verbose:
-                        print(f'      probe suffix {suf!r:>5}: empty PNG '
-                              f'({len(r.content)} B, all transparent)')
+                    # Any valid 256x256 PNG response means Bhuvan
+                    # successfully RENDERED this layer at this location.
+                    # Whether the probe tile happens to contain flood
+                    # cyan or is fully transparent doesn't matter — the
+                    # layer exists, and the real flood may be in tiles
+                    # we haven't sampled. Commit to this suffix and
+                    # let the stitcher fetch the full AOI.
+                    if verbose:
+                        rgba = im.convert('RGBA')
+                        alpha_max = max(rgba.split()[3].getextrema())
+                        note = (f'flood pixels at probe (alpha_max={alpha_max})'
+                                if alpha_max > 0
+                                else 'no flood at probe tile (all transparent), '
+                                     'but layer rendered — accepting')
+                        print(f'      probe suffix {suf!r:>5}: '
+                              f'HIT ({len(r.content)} B) — {note}')
+                    return layer
             except Exception as exc:
                 if verbose:
                     print(f'      probe suffix {suf!r:>5}: PNG decode '

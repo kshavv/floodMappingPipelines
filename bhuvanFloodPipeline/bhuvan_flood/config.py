@@ -67,7 +67,7 @@ def state_config(state: str) -> dict:
 # Bhuvan publishes flood layers with optional sub-day suffixes 06 / 12 / 18
 # (UTC hours). For a given calendar date we try the bare layer first, then
 # each suffix in order; the first one that returns 200 OK wins.
-LAYER_SUFFIX_PROBE = ['', '_06','_15','_04' '_12', '_18','_20']
+LAYER_SUFFIX_PROBE = [ '_18','_11','_20','', '_06','_15','_04', '_12']
 
 
 def state_polygon(state: str):
