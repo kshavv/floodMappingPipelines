@@ -1,18 +1,18 @@
 # Water Dataset Builder — Data Collection & Preparation
 
-This document describes how the water-classification training dataset is
-collected and prepared, and how to run the pipeline that builds it. The
-pipeline is triggered from your local machine but runs **entirely on
-Google Earth Engine (GEE)**; the output is a single GEE
-`FeatureCollection` asset that is used to train the Random Forest model.
+This document describes the following points:-
+- How the water-classification training dataset is collected and prepared.  
+- How to run the pipeline that builds it. 
 
+
+The output is a single csv tables which contains pixel level data for doing water classification.
 ---
 
 ## The Entire Flow of Data Collection / Preparation
 
 ### 1. Collecting Water Polygons
 
-Polygons are marked by hand in **Google Earth Pro**. There are four kinds
+Polygons are marked manually  in **Google Earth Pro**. There are four kinds
 of polygons in total:
 
 - **Large waterbodies** — large water polygons.
@@ -27,7 +27,7 @@ In addition, some polygons are marked later for **hard negative mining** —
 after running the flood classification, regions the Random Forest model
 mispredicts are added as negatives to correct the model.
 
-The polygons live in the repo under `waterDatasetBuilder/Data`. More
+The latest polygon data live in the repo under `waterDatasetBuilder/Data` which contains all 5 categories in seperate folder. More
 polygons can be added, or existing ones updated, simply by opening the
 files in Google Earth Pro and editing them.
 
@@ -87,7 +87,7 @@ Forest model. It is saved in GEE under the folder `finalDataset`.
    merge all categories → select output properties
             │
             ▼
-   Export.table.toAsset  →  single FeatureCollection asset
+   Export.table.toAsset  →  single FeatureCollection asset(Final Dataset)
 ```
 
 ---
@@ -107,8 +107,6 @@ Forest model. It is saved in GEE under the folder `finalDataset`.
   earthengine authenticate
   ```
 
-No other libraries are needed — there is no geopandas, pandas, or Drive
-client, because nothing is read from local disk or pulled back from GEE.
 
 ### Input preparation
 
