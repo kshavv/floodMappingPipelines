@@ -60,7 +60,7 @@ District Name
 ### Python Packages
 
 ```bash
-pip install pystac_client rasterio shapely pyproj geopandas requests numpy
+pip install -r requirements.txt
 ```
 
 ### GADM District Boundaries
