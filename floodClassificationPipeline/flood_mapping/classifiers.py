@@ -1,12 +1,7 @@
 """Train the two Random-Forest classifiers and produce per-bi-week
 binary water masks.
-
-This is a direct port of `rfWaterForBiweek` from `ee_app.js`, preserving
-the masking-out behaviour when a bi-week has no S1 or S2 scenes inside
-its search window.
 """
 from __future__ import annotations
-
 import ee
 
 from .config import (
@@ -19,18 +14,6 @@ from .config import (
 
 def train_classifiers(training_fc: ee.FeatureCollection) -> dict:
     """Train the two classifiers (fused S1+S2, S1-only).
-
-    Parameters
-    ----------
-    training_fc
-        Feature collection with one feature per training pixel.  Must
-        include numeric properties for all of `FEATURES_FUSED` and the
-        integer class label `waterType`, plus a `Name` property used
-        for the polygon-level train/test split.
-
-    Returns
-    -------
-    dict with keys ``fused`` and ``s1`` (both ``ee.Classifier``).
     """
     polygons = training_fc.distinct('Name').randomColumn('rand', SEED)
     train_polys = polygons.filter(ee.Filter.lt('rand', 0.99))
@@ -62,7 +45,7 @@ def _nearest_image(coll: ee.ImageCollection, target_date: ee.Date) -> ee.ImageCo
         diff = ee.Number(img.get('system:time_start')).subtract(
             target_date.millis()).abs()
         return img.set('date_dist', diff)
-    return coll.map(annot).sort('date_dist', False)
+    return coll.map(annot).sort('date_dist', False) #this sorting is important because when the tiles are mosaicked, it choses the first one in the collection
 
 
 def rf_water_for_biweek(target_date: ee.Date,
@@ -71,13 +54,11 @@ def rf_water_for_biweek(target_date: ee.Date,
                         s1_window_days: int = DEFAULT_S1_WINDOW,
                         s2_window_days: int = DEFAULT_S2_WINDOW) -> ee.Image:
     """Produce a single-band byte water mask for the bi-week centred on
-    `target_date`.
+    `target_date`(closest to target_date).
 
     The mask is the prediction of the fused (S1 + S2) classifier where
     S2 is cloud/shadow-free, and the S1-only classifier where S2 is
-    obstructed.  If either collection is empty inside its window, the
-    entire bi-week is masked out so downstream `unmask(0)` handles the
-    gap correctly.
+    obstructed. 
     """
     def pick(coll_id, w):
         c = (ee.ImageCollection(coll_id)

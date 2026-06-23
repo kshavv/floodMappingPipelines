@@ -8,8 +8,8 @@ ZOOM = 10
 TILE_PX = 256
 WORLD_WEST = -180.0
 WORLD_NORTH = 90.0
-TILE_SIZE_DEG = 180.0 / (2 ** ZOOM)          # 0.17578125 at z=10
-DEG_PER_PIXEL = TILE_SIZE_DEG / TILE_PX      # 0.0006866455... at z=10
+TILE_SIZE_DEG = 180.0 / (2 ** ZOOM)        
+DEG_PER_PIXEL = TILE_SIZE_DEG / TILE_PX    
 
 
 FLOOD_RGBA = (0, 255, 255, 255)
@@ -28,7 +28,7 @@ STATES = {
     'Daman and Diu':           {'code': 'XX',  'bbox': (70.4712, 20.1687, 73.0755, 21.1901), 'gaul': 'Daman and Diu'},
     'Delhi':                   {'code': 'XX',  'bbox': (76.6329, 28.2085, 77.5377, 29.0845), 'gaul': 'Delhi'},
     'Goa':                     {'code': 'XX',  'bbox': (73.4790, 14.6916, 74.5417, 15.9975), 'gaul': 'Goa'},
-    'Gujarat':                 {'code': 'XX',  'bbox': (67.9782, 19.9208, 74.6789, 24.9058), 'gaul': 'Gujarat'},
+    'Gujarat':                 {'code': 'gj',  'bbox': (67.9782, 19.9208, 74.6789, 24.9058), 'gaul': 'Gujarat'},
     'Haryana':                 {'code': 'hr', 'bbox': (74.2653, 27.4560, 77.7920, 31.1304), 'gaul': 'Haryana'},
     'Himachal Pradesh':        {'code': 'XX',  'bbox': (75.3788, 30.1845, 79.1957, 33.3719), 'gaul': 'Himachal Pradesh'},
     'Jharkhand':               {'code': 'XX',  'bbox': (83.1236, 21.7666, 88.1733, 25.5484), 'gaul': 'Jharkhand'},
@@ -39,12 +39,10 @@ STATES = {
     'Maharashtra':             {'code': 'XX',  'bbox': (72.4504, 15.4046, 81.0922, 22.2310), 'gaul': 'Maharashtra'},
     'Manipur':                 {'code': 'XX',  'bbox': (92.7736, 23.6360, 94.9432, 25.8977), 'gaul': 'Manipur'},
     'Meghalaya':                {'code': 'XX', 'bbox': (89.6157, 24.8288, 93.0044, 26.3187), 'gaul': 'Meghalaya'},
-    # --- Mizoram, Nagaland, Odisha, Puducherry, Punjab, Rajasthan,
-    # --- Sikkim, Tamil Nadu, Telangana?, Tripura : add here when you
-    # --- re-paste the truncated middle of your GAUL output.
     'Uttar Pradesh':           {'code': 'XX',  'bbox': (76.8849, 23.6728, 84.8306, 30.6125), 'gaul': 'Uttar Pradesh'},
     'Uttarakhand':             {'code': 'XX',  'bbox': (77.3622, 28.5156, 81.2433, 31.4909), 'gaul': 'Uttarakhand'},
     'West Bengal':             {'code': 'XX',  'bbox': (85.6264, 20.6685, 90.0775, 27.4210), 'gaul': 'West Bengal'},
+    'Punjab':                  {'code': 'pb', 'bbox': (73.6700, 29.3300, 77.1300, 32.7000), 'gaul': 'Punjab'},
 }
 
 
@@ -67,7 +65,7 @@ def state_config(state: str) -> dict:
 # Bhuvan publishes flood layers with optional sub-day suffixes 06 / 12 / 18
 # (UTC hours). For a given calendar date we try the bare layer first, then
 # each suffix in order; the first one that returns 200 OK wins.
-LAYER_SUFFIX_PROBE = [ '_18','_11','_20','', '_06','_15','_04', '_12']
+LAYER_SUFFIX_PROBE = [ '_10','_18','_11','_20','', '_06','_15','_04', '_12']
 
 
 def state_polygon(state: str):
