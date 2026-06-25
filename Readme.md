@@ -1,7 +1,5 @@
 # Project Documentation
 
-
-
 ## Contents
 
 1. [Project Overview](#project-overview) — how the four parts connect
@@ -1127,10 +1125,3 @@ If `check_spatial_coverage` reports < 100%, the district likely straddles a fixe
 The EODC API occasionally returns transient errors. Adding a retry loop around `requests.get` calls (with exponential backoff) is recommended for large downloads.
 
 ---
-
-#### Notes on Design Choices
-
-- `nodata=255` is used (not `0`) during district clipping because `0` appears in intermediate outputs as an unassigned pixel value. Using `0` as nodata would make it ambiguous; `255` is safely outside the 1–4 class range.
-- Within the district boundary, `0` pixels do not appear in the final output because the reference water layer provides complete land/water coverage — every pixel resolves to land (2), seasonal water (3), or permanent water (4) at minimum.
-- Reference water is merged once and shared across all dates because it is a static layer — it does not vary by acquisition date.
-- The biweekly period is a fixed 14-day window anchored to Jan 1.

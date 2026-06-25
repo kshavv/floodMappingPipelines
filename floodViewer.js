@@ -1,19 +1,8 @@
 // ============================================================
 // CLASSIFIED FLOOD MAP — VIEWER + BHUVAN COMPARISON
 // ============================================================
-//
-// This app views:
-//   * Classified_<year>_<title>   (26 bands, BW_1 .. BW_26)
-//     Produced by the Python classification pipeline.
-//   * Bhuvan_<year>_<title>       (10 bands, BW_12 .. BW_21)
-//     Produced by the Python Bhuvan biweek pipeline, uploaded to EE.
-//
-// On Kharif bi-weeks (BW_12..BW_21) the two layers can be displayed
-// side-by-side and compared inside a user-defined bbox. Comparison
-// merges classified codes {3, 4, 5} into "flooded" (perennial 1 and
-// land 2 are NOT counted as flooded), and Bhuvan code 1 into "flooded"
-// (255 nodata excluded on both sides). The app reports the confusion
-// matrix and precision / recall / F1.
+// This is used to visualize the flood maps over the entire year
+// also used to compare the result with Bhuvan bi-weekly flood maps (BW_12..BW_21) for Kharif season.
 // ============================================================
 
 
