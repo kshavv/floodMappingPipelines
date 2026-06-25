@@ -1,9 +1,6 @@
 # Project Documentation
 
-Complete documentation for the flood-modelling project. It
-covers how the whole system fits together and then documents each of the four
-parts in full. Start with the **Project Overview**, then jump to whichever part
-you need via the contents below.
+
 
 ## Contents
 
