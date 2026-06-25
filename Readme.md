@@ -14,24 +14,14 @@
 
 ## Project Overview
 
-### The one-paragraph summary
-
-We build our **own** flood maps (Part 2) using a machine-learning model that
-separates water from non-water in satellite imagery. That model is trained on a
-hand-labelled dataset we assemble ourselves (Part 1). To **check whether our maps
-are any good**, we compare them against two independent, externally-produced flood
-products — Bhuvan/NRSC (Part 3) and GloFAS/GFM (Part 4). So Parts 1→2 are our
-pipeline (build the product); Parts 3 and 4 are reference data for
-validation/comparison.
-
 ### What each part produces
 
 | Part | Section | What it produces |
 |------|---------|------------------|
 | 1. Data Collection | [Part 1](#part-1--data-collection--dataset-building) | The labelled pixel dataset that trains the water model (`full_dataset_v3.csv`) |
 | 2. Flood Classification | [Part 2](#part-2--flood-classification-pipeline) | Our own per-state/district classified flood maps from Sentinel-1/2 |
-| 3. Bhuvan Pipeline | [Part 3](#part-3--bhuvan-flood-pipeline) | Daily / Kharif flood-extent rasters from Bhuvan/NRSC (external reference) |
-| 4. GloFAS / GFM Pipeline | [Part 4](#part-4--glofas--gfm-flood-pipeline) | Biweekly flood-extent rasters from the GFM service (external reference) |
+| 3. Bhuvan Pipeline | [Part 3](#part-3--bhuvan-flood-pipeline) | Daily / Kharif flood-extent rasters from Bhuvan/NRSC |
+| 4. GloFAS / GFM Pipeline | [Part 4](#part-4--glofas--gfm-flood-pipeline) | Biweekly flood-extent rasters from the GFM service|
 
 ### How the parts connect (data flow)
 
