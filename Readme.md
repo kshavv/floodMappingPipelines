@@ -61,6 +61,7 @@
         └───────────────────────────────────────────────────────────┘
 ```
 
+**Note** - Every pipeline has a well maintained config file which contain important configuration for that project.
 
 ## Part 1 — Data Collection & Dataset Building
 
