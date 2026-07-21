@@ -89,6 +89,8 @@ of polygons in total:
 - **Small polygons – cannot sample non-water** — the small-waterbody
   equivalent of the above.
 
+**Note**: CNDW or CNNW refers to the polygon from which we cannot derive non water  pixels (Its just a naming convention).
+
 In addition, some polygons are marked later for **hard negative mining** —
 after running the flood classification, regions the Random Forest model
 mispredicts are added as negatives to correct the model.
@@ -130,6 +132,7 @@ Forest model.
 
 > **Note:** the  dataset is also present in the repo at
 > `waterDatasetBuilder/Data/full_dataset_v3.csv`.
+>  The final Dataset now contains coordinate information.
 
 ##### Data-flow diagram
 
